@@ -1,12 +1,17 @@
 """
 📈 Aktien-Alarm Bot — Telegram
-Schönes Format + News alle 6h
+Preisquellen:
+  Aktien/Rohstoffe → Stooq.com (zuverlässig auf Cloud-Servern, kein API-Key)
+  Krypto           → CoinGecko (kostenlos)
+  EUR/USD          → frankfurter.app
 """
 
 import requests
 import schedule
 import time
 import threading
+import csv
+import io
 from datetime import datetime
 import pytz
 
@@ -20,68 +25,56 @@ DE_TZ = pytz.timezone("Europe/Berlin")
 US_TZ = pytz.timezone("America/New_York")
 
 # ─────────────────────────────────────────────
-#  TICKER
+#  TICKER  (Display-Name, Stooq-Symbol)
+#  US-Aktien: symbol.us | DE: symbol.de | KR: 005930.kr
+#  Stooq-Rohstoffe: xauusd, xagusd
 # ─────────────────────────────────────────────
 
-# (Symbol, Anzeigename, CoinGecko-ID oder None)
 KRYPTO = {
-    "BTC":  ("Bitcoin",     "bitcoin"),
-    "ETH":  ("Ethereum",    "ethereum"),
-    "SOL":  ("Solana",      "solana"),
-    "HYPE": ("Hyperliquid", "hyperliquid"),
+    "BTC":  ("Bitcoin",          "bitcoin"),
+    "ETH":  ("Ethereum",         "ethereum"),
+    "SOL":  ("Solana",           "solana"),
+    "HYPE": ("Hyperliquid",      "hyperliquid"),
 }
 
-HALBLEITER = {
-    "AMD":  "AMD",
-    "INTC": "Intel",
-    "MU":   "Micron",
-    "NOW":  "ServiceNow",
-    "SNDK": "SanDisk",
-    "CRWV": "CoreWeave",
-    "CRCL": "Circle",
-    "NBIS": "Nebius",
-    "CGEH": "CGEH",
+# (Anzeigename, Stooq-Ticker, Währung)
+STOCKS = {
+    # Halbleiter & Tech
+    "AMD":   ("AMD",             "amd.us",    "USD"),
+    "INTC":  ("Intel",           "intc.us",   "USD"),
+    "MU":    ("Micron",          "mu.us",     "USD"),
+    "NOW":   ("ServiceNow",      "now.us",    "USD"),
+    "SNDK":  ("SanDisk",         "sndk.us",   "USD"),
+    "CRWV":  ("CoreWeave",       "crwv.us",   "USD"),
+    "CRCL":  ("Circle",          "crcl.us",   "USD"),
+    "NBIS":  ("Nebius",          "nbis.us",   "USD"),
+    "CGEH":  ("CGEH",            "cgeh.us",   "USD"),
+    # Aktien
+    "HOOD":  ("Robinhood",       "hood.us",   "USD"),
+    "RKLB":  ("Rocket Lab",      "rklb.us",   "USD"),
+    "BE":    ("Bloom Energy",    "be.us",     "USD"),
+    "IREN":  ("Iris Energy",     "iren.us",   "USD"),
+    "WDC":   ("Western Digital", "wdc.us",    "USD"),
+    "CAT":   ("Caterpillar",     "cat.us",    "USD"),
+    "TEAM":  ("Atlassian",       "team.us",   "USD"),
+    "FLY":   ("Firefly",         "fly.us",    "USD"),
+    "SMEGF": ("Siemens Energy",  "smegf.us",  "USD"),  # OTC US
+    "SSNLF": ("Samsung",         "ssnlf.us",  "USD"),  # OTC US
+    # Rohstoffe
+    "GOLD":  ("Gold",            "xauusd",    "USD"),
+    "SILB":  ("Silber",          "xagusd",    "USD"),
 }
 
-AKTIEN = {
-    "HOOD": "Robinhood",
-    "RKLB": "Rocket Lab",
-    "BE":   "Bloom Energy",
-    "IREN": "Iris Energy",
-    "ENR":  "Energizer",
-    "WDC":  "Western Digital",
-    "CAT":  "Caterpillar",
-    "TEAM": "Atlassian",
-    "FLY":  "Firefly",    # ← NASDAQ: FLY
-}
-
-ROHSTOFFE = {
-    "GC=F": "Gold",
-    "SI=F": "Silber",
-}
-
-ALLE_STOCKS = {**HALBLEITER, **AKTIEN, **ROHSTOFFE}
-
-# News-Ticker für Yahoo Finance (Englisch besser für Ergebnisse)
-NEWS_ALLGEMEIN = ["^GSPC", "^IXIC", "^DJI"]
-NEWS_TICKER_MAP = {
-    "BTC-USD": "₿ Bitcoin",
-    "ETH-USD": "Ξ Ethereum",
-    "SOL-USD": "◎ Solana",
-    "AMD":  "AMD",
-    "INTC": "Intel",
-    "MU":   "Micron",
-    "NVDA": "NVIDIA",
-    "CRWV": "CoreWeave",
-    "HOOD": "Robinhood",
-    "RKLB": "Rocket Lab",
-    "CAT":  "Caterpillar",
-    "FLY":  "Firefly",
-    "GC=F": "Gold",
-}
+# Interne Kürzel → Anzeigename (für Alarm-Nachrichten)
+def get_name(sym: str) -> str:
+    if sym in KRYPTO:
+        return KRYPTO[sym][0]
+    if sym in STOCKS:
+        return STOCKS[sym][0]
+    return sym
 
 # ─────────────────────────────────────────────
-#  INTERNER SPEICHER
+#  SPEICHER
 # ─────────────────────────────────────────────
 
 letzter_kurs:  dict[str, float] = {}
@@ -92,11 +85,13 @@ offset_id:     list[int] = [0]
 #  DATENQUELLEN
 # ─────────────────────────────────────────────
 
-YF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
 }
 
+# ── EUR/USD ──────────────────────────────────
 def eur_rate() -> float:
     try:
         r = requests.get(
@@ -109,25 +104,47 @@ def eur_rate() -> float:
         print(f"[EUR] {e}")
     return 0.91
 
-def yahoo_kurs(ticker: str) -> float | None:
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        r = requests.get(url, headers=YF_HEADERS,
-                         params={"interval": "1m", "range": "1d"}, timeout=10)
-        if r.ok:
-            meta = r.json()["chart"]["result"][0]["meta"]
-            p = meta.get("regularMarketPrice") or meta.get("previousClose")
-            return round(float(p), 6) if p else None
-    except Exception as e:
-        print(f"[YF {ticker}] {e}")
-    return None
+# ── STOOQ Batch ──────────────────────────────
+def stooq_batch(stooq_tickers: list[str]) -> dict[str, float]:
+    """
+    Stooq CSV-API: liefert mehrere Aktien auf einmal.
+    Format: https://stooq.com/q/l/?s=amd.us,intc.us&f=sd2t2ohlcv&h&e=csv
+    Gibt {stooq_ticker: kurs} zurück.
+    """
+    result = {}
+    # Stooq erlaubt bis zu ~50 Ticker pro Anfrage
+    for i in range(0, len(stooq_tickers), 40):
+        batch = stooq_tickers[i:i+40]
+        symbols = ",".join(batch)
+        try:
+            url = f"https://stooq.com/q/l/?s={symbols}&f=sd2t2ohlcv&h&e=csv"
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.ok:
+                reader = csv.DictReader(io.StringIO(r.text))
+                for row in reader:
+                    sym = row.get("Symbol", "").lower().strip()
+                    close = row.get("Close", "").strip()
+                    # Stooq gibt "N/D" wenn kein Kurs
+                    if close and close not in ("N/D", "0.00", ""):
+                        try:
+                            result[sym] = round(float(close), 6)
+                        except ValueError:
+                            pass
+            else:
+                print(f"[Stooq] HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[Stooq Fehler] {e}")
+        time.sleep(0.5)
+    return result
 
+# ── CoinGecko ─────────────────────────────────
 def coingecko_kurse() -> dict[str, float]:
     try:
         ids = ",".join(cid for _, cid in KRYPTO.values())
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": ids, "vs_currencies": "usd"}, timeout=10
+            params={"ids": ids, "vs_currencies": "usd"},
+            timeout=12
         )
         if r.ok:
             data = r.json()
@@ -141,116 +158,123 @@ def coingecko_kurse() -> dict[str, float]:
         print(f"[CoinGecko] {e}")
     return {}
 
+# ── Alle Kurse holen ──────────────────────────
 def alle_kurse() -> dict[str, float]:
-    kurse = {}
-    kurse.update(coingecko_kurse())
-    for ticker in ALLE_STOCKS:
-        k = yahoo_kurs(ticker)
-        if k:
-            kurse[ticker] = k
-        time.sleep(0.15)
+    print("  → CoinGecko (Krypto)...")
+    kurse = coingecko_kurse()
+    print(f"     {len(kurse)}/{len(KRYPTO)} Krypto")
+
+    print("  → Stooq (Aktien & Rohstoffe)...")
+    # Stooq-Ticker-Liste aufbauen
+    stooq_map = {v[1]: k for k, v in STOCKS.items()}  # stooq_sym → unsere_id
+    stooq_list = [v[1] for v in STOCKS.values()]
+    stooq_result = stooq_batch(stooq_list)
+
+    # Stooq-Ergebnis auf unsere IDs mappen
+    mapped = 0
+    for stooq_sym, price in stooq_result.items():
+        our_id = stooq_map.get(stooq_sym)
+        if our_id:
+            kurse[our_id] = price
+            mapped += 1
+
+    print(f"     {mapped}/{len(STOCKS)} Aktien")
     return kurse
 
 # ─────────────────────────────────────────────
-#  NEWS — Yahoo Finance
+#  NEWS (Yahoo Finance)
 # ─────────────────────────────────────────────
 
-def yahoo_news(query: str, count: int = 3) -> list[dict]:
+NEWS_QUERIES = {
+    "^GSPC":    "🌍 Markt",
+    "BTC-USD":  "₿ Bitcoin",
+    "ETH-USD":  "Ξ Ethereum",
+    "AMD":      "AMD",
+    "INTC":     "Intel",
+    "CRWV":     "CoreWeave",
+    "ENR.DE":   "Siemens Energy",
+    "HOOD":     "Robinhood",
+    "RKLB":     "Rocket Lab",
+    "CAT":      "Caterpillar",
+    "FLY":      "Firefly",
+}
+
+def yahoo_news(query: str, count: int = 2) -> list[dict]:
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v1/finance/search",
-            headers=YF_HEADERS,
-            params={"q": query, "newsCount": count, "enableFuzzyQuery": "false"},
+            headers=HEADERS,
+            params={"q": query, "newsCount": count},
             timeout=8
         )
         if r.ok:
             return r.json().get("news", [])[:count]
-    except Exception as e:
-        print(f"[News {query}] {e}")
+    except Exception:
+        pass
     return []
 
 def news_bericht_erstellen() -> str:
     jetzt = datetime.now(DE_TZ).strftime("%d.%m.%Y  %H:%M Uhr")
     zeilen = [
         "━━━━━━━━━━━━━━━━━━━━━━",
-        f"📰  <b>MARKTNEWS</b>",
+        "📰  <b>MARKTNEWS</b>",
         f"🕐  {jetzt}",
         "━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
-
-    # Allgemeine Marktnews
-    zeilen.append("🌍  <b>MARKTÜBERBLICK</b>")
-    seen_titles = set()
-    for idx_ticker in NEWS_ALLGEMEIN:
-        for item in yahoo_news(idx_ticker, 2):
-            title = item.get("title", "").strip()
-            if title and title not in seen_titles:
-                seen_titles.add(title)
-                pub = item.get("publisher", "")
-                zeilen.append(f"  ▸ <b>{pub}:</b> {title}")
-    zeilen.append("")
-
-    # Ticker-spezifische News
-    for ticker, label in NEWS_TICKER_MAP.items():
-        nachrichten = yahoo_news(ticker, 2)
-        neue = [n for n in nachrichten if n.get("title", "") not in seen_titles]
+    seen = set()
+    for query, label in NEWS_QUERIES.items():
+        items = yahoo_news(query, 2)
+        neue = [n for n in items if n.get("title", "") not in seen]
         if not neue:
             continue
         zeilen.append(f"<b>{label}</b>")
         for item in neue[:2]:
-            title = item.get("title", "").strip()
-            if title:
-                seen_titles.add(title)
+            t = item.get("title", "").strip()
+            if t:
+                seen.add(t)
                 pub = item.get("publisher", "")
-                zeilen.append(f"  ▸ <b>{pub}:</b> {title}")
+                zeilen.append(f"  ▸ <b>{pub}:</b> {t}")
         zeilen.append("")
-
     return "\n".join(zeilen).rstrip()
 
 # ─────────────────────────────────────────────
-#  FORMATIERUNG — Kursbericht
+#  FORMATIERUNG
 # ─────────────────────────────────────────────
 
 def fmt_usd(v: float) -> str:
-    if v >= 10000: return f"${v:>10,.0f}"
-    if v >= 100:   return f"${v:>10,.2f}"
-    if v >= 1:     return f"${v:>10,.3f}"
-    return         f"${v:>10,.4f}"
+    if v >= 10000: return f"${v:,.0f}"
+    if v >= 100:   return f"${v:,.2f}"
+    if v >= 1:     return f"${v:,.3f}"
+    return f"${v:,.4f}"
 
 def fmt_eur(v: float, rate: float) -> str:
     e = v * rate
-    if e >= 10000: return f"{e:>9,.0f}€"
-    if e >= 100:   return f"{e:>9,.2f}€"
-    if e >= 1:     return f"{e:>9,.3f}€"
-    return         f"{e:>9,.4f}€"
+    if e >= 10000: return f"{e:,.0f}€"
+    if e >= 100:   return f"{e:,.2f}€"
+    if e >= 1:     return f"{e:,.3f}€"
+    return f"{e:,.4f}€"
 
-def fmt_diff(sym: str, kurs: float) -> str:
+def get_pfeil_diff(sym: str, kurs: float) -> tuple[str, str]:
     ref = referenz_kurs.get(sym)
     if not ref or ref <= 0:
-        return "     ±0%"
+        return "⚪", ""
     d = (kurs - ref) / ref * 100
-    if d > 0:   return f" <b>+{d:.2f}%</b>"
-    if d < 0:   return f" <b>{d:.2f}%</b>"
-    return "     ±0%"
-
-def kreis(sym: str, kurs: float) -> str:
-    ref = referenz_kurs.get(sym)
-    if not ref or ref <= 0:
-        return "⚪"
-    d = (kurs - ref) / ref * 100
-    if d >= 0.05:  return "🟢"
-    if d <= -0.05: return "🔴"
-    return "⚪"
+    if d >= 0.05:  return "🟢", f"▲ +{d:.2f}%"
+    if d <= -0.05: return "🔴", f"▼ {d:.2f}%"
+    return "⚪", "±0%"
 
 def kurs_zeile(sym: str, name: str, kurs: float | None, rate: float) -> str:
     if kurs is None:
-        return f"  ⚠️  <i>{name}</i>"
-    k = kreis(sym, kurs)
-    d = fmt_diff(sym, kurs)
+        return f"  ⚠️  <i>{name}</i>  <code>—</code>"
+    emoji, diff = get_pfeil_diff(sym, kurs)
     u = fmt_usd(kurs)
     e = fmt_eur(kurs, rate)
-    return f"  {k} <b>{name}</b>\n     <code>{u}  {e}</code>  {d}"
+    diff_part = f"  <b>{diff}</b>" if diff else ""
+    return (
+        f"  {emoji} <b>{name}</b>\n"
+        f"      <code>{u:>12}  {e:>10}</code>{diff_part}"
+    )
 
 def bericht_erstellen(kurse: dict[str, float], rate: float, titel: str) -> str:
     jetzt = datetime.now(DE_TZ).strftime("%d.%m.%Y  %H:%M Uhr")
@@ -263,20 +287,23 @@ def bericht_erstellen(kurse: dict[str, float], rate: float, titel: str) -> str:
         "",
         "🪙  <b>KRYPTO</b>",
     ]
-    for sym, (name, _) in KRYPTO.items():
+    for sym in KRYPTO:
+        name = KRYPTO[sym][0]
         lines.append(kurs_zeile(sym, name, kurse.get(sym), rate))
 
+    halbleiter = ["AMD", "INTC", "MU", "NOW", "SNDK", "CRWV", "CRCL", "NBIS", "CGEH"]
     lines += ["", "💾  <b>HALBLEITER &amp; TECH</b>"]
-    for sym, name in HALBLEITER.items():
-        lines.append(kurs_zeile(sym, name, kurse.get(sym), rate))
+    for sym in halbleiter:
+        lines.append(kurs_zeile(sym, STOCKS[sym][0], kurse.get(sym), rate))
 
+    aktien = ["HOOD", "RKLB", "BE", "IREN", "WDC", "CAT", "TEAM", "FLY", "SMEGF", "SSNLF"]
     lines += ["", "📈  <b>AKTIEN</b>"]
-    for sym, name in AKTIEN.items():
-        lines.append(kurs_zeile(sym, name, kurse.get(sym), rate))
+    for sym in aktien:
+        lines.append(kurs_zeile(sym, STOCKS[sym][0], kurse.get(sym), rate))
 
     lines += ["", "🪨  <b>ROHSTOFFE</b>"]
-    for sym, name in ROHSTOFFE.items():
-        lines.append(kurs_zeile(sym, name, kurse.get(sym), rate))
+    for sym in ["GOLD", "SILB"]:
+        lines.append(kurs_zeile(sym, STOCKS[sym][0], kurse.get(sym), rate))
 
     lines += ["", "━━━━━━━━━━━━━━━━━━━━━━"]
     return "\n".join(lines)
@@ -302,78 +329,68 @@ def telegram_senden(text: str) -> None:
 #  SCHEDULE-FUNKTIONEN
 # ─────────────────────────────────────────────
 
-def check_alarme() -> None:
-    print(f"[{datetime.now(DE_TZ).strftime('%H:%M')}] Alarm-Check...")
+def routine_15min() -> None:
+    jetzt = datetime.now(DE_TZ).strftime("%H:%M")
+    print(f"[{jetzt}] 15-Min Routine...")
+
     rate  = eur_rate()
     kurse = alle_kurse()
-    jetzt = datetime.now(DE_TZ).strftime("%H:%M Uhr")
 
+    # ── Alarm bei starker Bewegung ──
+    jetzt_str = datetime.now(DE_TZ).strftime("%H:%M Uhr")
     for sym, k_neu in kurse.items():
-        if sym in KRYPTO:
-            name = KRYPTO[sym][0]
-        else:
-            name = ALLE_STOCKS.get(sym, sym)
+        name = get_name(sym)
         if sym not in letzter_kurs:
             letzter_kurs[sym] = k_neu
             continue
         k_alt = letzter_kurs[sym]
         diff = (k_neu - k_alt) / k_alt * 100
         if abs(diff) >= ALARM_SCHWELLE_PCT:
-            emoji = "🚀📈" if diff > 0 else "🔻📉"
+            emoji    = "🚀📈" if diff > 0 else "🔻📉"
             richtung = "gestiegen" if diff > 0 else "gefallen"
             telegram_senden(
                 f"{emoji}  <b>ALARM — {name}</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"Kurs {richtung}: <b>{diff:+.2f}%</b>\n"
-                f"💵  {fmt_usd(k_alt).strip()} → <b>{fmt_usd(k_neu).strip()}</b>\n"
-                f"💶  {fmt_eur(k_alt, rate).strip()} → <b>{fmt_eur(k_neu, rate).strip()}</b>\n"
-                f"⏰  {jetzt}"
+                f"💵  {fmt_usd(k_alt)} → <b>{fmt_usd(k_neu)}</b>\n"
+                f"💶  {fmt_eur(k_alt, rate)} → <b>{fmt_eur(k_neu, rate)}</b>\n"
+                f"⏰  {jetzt_str}"
             )
-            print(f"  ✅ Alarm: {sym} {diff:+.2f}%")
-        letzter_kurs[sym] = k_neu
+            print(f"  🚨 Alarm: {sym} {diff:+.2f}%")
 
-def kursbericht_senden(titel: str = "Kursbericht") -> None:
-    rate  = eur_rate()
-    kurse = alle_kurse()
-    msg   = bericht_erstellen(kurse, rate, titel)
-    telegram_senden(msg)
-    referenz_kurs.update(kurse)
     letzter_kurs.update(kurse)
 
-def stunden_bericht() -> None:
-    now = datetime.now(DE_TZ)
-    if not (8 <= now.hour < 23):
-        return
-    rate  = eur_rate()
-    kurse = alle_kurse()
-    if referenz_kurs:
-        max_diff = max(
-            abs((k - referenz_kurs[s]) / referenz_kurs[s] * 100)
-            for s, k in kurse.items() if s in referenz_kurs and referenz_kurs[s] > 0
-        ) if kurse else 0
-        if max_diff < 0.5:
-            print("  ⏭️ Kein Bericht (keine Bewegung)")
-            return
-    msg = bericht_erstellen(kurse, rate, "Stündlicher Bericht")
-    telegram_senden(msg)
+    # ── Kursbericht immer senden ──
+    bericht = bericht_erstellen(kurse, rate, "15-Min Kursbericht")
+    telegram_senden(bericht)
     referenz_kurs.update(kurse)
+    print(f"  ✅ Bericht gesendet ({len(kurse)}/{len(STOCKS)+len(KRYPTO)} Kurse)")
 
-def news_bericht_senden() -> None:
-    print(f"[{datetime.now(DE_TZ).strftime('%H:%M')}] News-Bericht...")
-    try:
-        msg = news_bericht_erstellen()
-        telegram_senden(msg)
-        print("  ✅ News gesendet")
-    except Exception as e:
-        print(f"  ❌ News Fehler: {e}")
 
 def boersenstart_alert() -> None:
     if datetime.now(US_TZ).weekday() >= 5:
         return
-    kursbericht_senden("🔔 US-Börse öffnet")
+    rate  = eur_rate()
+    kurse = alle_kurse()
+    referenz_kurs.update(kurse)
+    letzter_kurs.update(kurse)
+    telegram_senden(bericht_erstellen(kurse, rate, "🔔 US-Börse öffnet"))
+
 
 def tagesbericht() -> None:
-    kursbericht_senden("📅 Tagesbericht")
+    rate  = eur_rate()
+    kurse = alle_kurse()
+    telegram_senden(bericht_erstellen(kurse, rate, "📅 Tagesbericht"))
+    referenz_kurs.update(kurse)
+    letzter_kurs.update(kurse)
+
+
+def news_bericht_senden() -> None:
+    print(f"[{datetime.now(DE_TZ).strftime('%H:%M')}] News...")
+    try:
+        telegram_senden(news_bericht_erstellen())
+    except Exception as e:
+        print(f"  ❌ {e}")
 
 # ─────────────────────────────────────────────
 #  TELEGRAM COMMANDS (POLLING)
@@ -382,7 +399,6 @@ def tagesbericht() -> None:
 def handle_command(text: str) -> None:
     cmd = text.strip().lower().split()[0]
     print(f"  [CMD] {cmd}")
-
     if cmd in ("/start", "/hilfe"):
         telegram_senden(
             "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -394,21 +410,26 @@ def handle_command(text: str) -> None:
             "  📊  /report  — Tagesbericht\n"
             "  ❓  /hilfe   — Diese Übersicht\n\n"
             f"⚡  Alarm ab ±{ALARM_SCHWELLE_PCT}%\n"
-            "📈  Stündl. Bericht (8–23 Uhr)\n"
-            "📰  News alle 6h\n"
+            f"📊  Kursbericht alle {CHECK_INTERVAL_MIN} Min\n"
+            "📰  News um 8:00, 14:00, 20:00 Uhr\n"
             "🔔  US-Börsenstart 15:30 Uhr\n"
             "📅  Tagesbericht 20:00 Uhr"
         )
     elif cmd == "/refresh":
         telegram_senden("🔄  Hole aktuelle Kurse...")
-        kursbericht_senden("🔄 Manueller Refresh")
+        rate  = eur_rate()
+        kurse = alle_kurse()
+        telegram_senden(bericht_erstellen(kurse, rate, "🔄 Manueller Refresh"))
+        referenz_kurs.update(kurse)
+        letzter_kurs.update(kurse)
     elif cmd == "/news":
-        telegram_senden("📰  Hole aktuelle News...")
+        telegram_senden("📰  Hole News...")
         news_bericht_senden()
     elif cmd == "/report":
         tagesbericht()
     else:
-        telegram_senden(f"❓ Unbekannt: <code>{text}</code>\nVerfügbar: /refresh /news /report /hilfe")
+        telegram_senden(f"❓ Unbekannt: <code>{text}</code>\n→ /hilfe")
+
 
 def polling_loop() -> None:
     print("[Polling] Gestartet")
@@ -435,31 +456,31 @@ def polling_loop() -> None:
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("📈 Aktien-Alarm Bot")
-    print(f"   {len(ALLE_STOCKS) + len(KRYPTO)} Ticker  |  ±{ALARM_SCHWELLE_PCT}%  |  {CHECK_INTERVAL_MIN}-Min-Check")
+    print("📈 Aktien-Alarm Bot (Stooq + CoinGecko)")
+    print(f"   {len(STOCKS) + len(KRYPTO)} Ticker  |  ±{ALARM_SCHWELLE_PCT}%  |  {CHECK_INTERVAL_MIN}-Min")
     print("=" * 55)
 
     threading.Thread(target=polling_loop, daemon=True).start()
 
     telegram_senden(
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖  <b>AKTIEN-ALARM BOT GESTARTET</b>\n"
+        "🤖  <b>BOT GESTARTET</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📌  {len(ALLE_STOCKS) + len(KRYPTO)} Ticker aktiv\n"
-        f"⚡  Alarm ab ±{ALARM_SCHWELLE_PCT}% Bewegung\n"
-        "📈  Stündl. Bericht (8–23 Uhr)\n"
-        "📰  News alle 6h (8, 14, 20 Uhr)\n"
-        "🔔  US-Börsenstart 15:30 Uhr\n"
-        "📅  Tagesbericht 20:00 Uhr\n\n"
+        f"📌  {len(STOCKS)+len(KRYPTO)} Ticker aktiv\n"
+        f"⚡  Alarm ab ±{ALARM_SCHWELLE_PCT}%\n"
+        f"📊  Kursbericht alle {CHECK_INTERVAL_MIN} Min\n"
+        "📰  News: 8:00, 14:00, 20:00 Uhr\n"
+        "🔔  US-Börsenstart: 15:30 Uhr\n\n"
         "Befehle: /refresh  /news  /report  /hilfe"
     )
 
-    # Startkurse
-    kursbericht_senden("📊 Startkurse")
+    rate_init  = eur_rate()
+    kurse_init = alle_kurse()
+    referenz_kurs.update(kurse_init)
+    letzter_kurs.update(kurse_init)
+    telegram_senden(bericht_erstellen(kurse_init, rate_init, "📊 Startkurse"))
 
-    # Zeitplan
-    schedule.every(CHECK_INTERVAL_MIN).minutes.do(check_alarme)
-    schedule.every().hour.at(":00").do(stunden_bericht)
+    schedule.every(CHECK_INTERVAL_MIN).minutes.do(routine_15min)
     schedule.every().day.at("08:00").do(news_bericht_senden)
     schedule.every().day.at("14:00").do(news_bericht_senden)
     schedule.every().day.at("15:30").do(boersenstart_alert)
